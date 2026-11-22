@@ -10,6 +10,12 @@ target="$(make -s -C "$(git rev-parse --show-toplevel)" status 2>/dev/null | sed
 [ "$target" = "$head" ] && exit 0
 
 echo "hosts: main is now at $head — installing (tests run first)…"
+cd "$(git rev-parse --show-toplevel)" || exit 0
 # Hooks get no terminal on stdin; give sudo one so it can ask for the password.
-make -s install </dev/tty || echo "hosts: auto-install skipped or failed — run 'make install' when ready."
+# Without a terminal (e.g. a GUI git app) install can only work if it needs no password.
+if (: </dev/tty) 2>/dev/null; then
+  make -s install </dev/tty
+else
+  make -s install </dev/null
+fi || echo "hosts: auto-install skipped or failed — run 'make install' when ready."
 exit 0
