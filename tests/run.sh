@@ -489,6 +489,14 @@ test_vanished_check_uses_exact_names() {
   says 'set "dev" was on, but its lines have been removed' check
 }
 
+test_print_only_commands_write_nothing() {
+  fresh; rm -rf "$T/sets"
+  h version >/dev/null; h --version >/dev/null; h help >/dev/null; h -h >/dev/null
+  ! h bogus 2>/dev/null; check [ $? = 0 ]
+  check [ ! -e "$T/sets" ]                                        # no folder, no copy of the hosts file
+  h list >/dev/null; check [ -d "$T/sets" ]                       # real commands still set it up
+}
+
 # --- run ---------------------------------------------------------------------
 
 echo "Running hosts tests"

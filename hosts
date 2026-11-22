@@ -67,7 +67,6 @@ need_name() {
 set_file() { echo "$SETS_DIR/$1.hosts"; }
 is_on()    { tr -d '\r' < "$HOSTS_FILE" | grep -qxF "$BEGIN$1"; }
 
-mkdir -p "$SETS_DIR" "$BACKUP_DIR"
 
 # Print a hosts file (default: the real one) with the named set's block removed.
 # Refuses (rather than guessing) if the block's end marker is missing, so
@@ -618,6 +617,16 @@ cmd_repair() {
   notice_added
 }
 
+# Commands that only print (help, version, a mistyped command) touch nothing:
+# no ~/.hosts-sets folder is created and no copy of the hosts file is saved.
+case "${1:-list}" in
+  version|-v|--version) echo "hosts $VERSION"; exit 0 ;;
+  -h|--help|help) awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  list|ls|on|enable|off|disable|edit|new|show|cat|delete|rm|import|restore|changes|diff|adopt|keep|check|doctor|repair|fix) ;;
+  *) die "unknown command '$1' (try: hosts help)" ;;
+esac
+
+mkdir -p "$SETS_DIR" "$BACKUP_DIR"
 ensure_last
 
 case "${1:-list}" in
@@ -634,7 +643,4 @@ case "${1:-list}" in
   keep)         cmd_keep ;;
   check|doctor) cmd_check ;;
   repair|fix)   cmd_repair ;;
-  version|-v|--version) echo "hosts $VERSION" ;;
-  -h|--help|help) awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown command '$1' (try: hosts help)" ;;
 esac
