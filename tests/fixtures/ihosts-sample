@@ -1,0 +1,40 @@
+# ----------------------------
+# Default
+##
+# Host Database
+#
+# localhost is used to configure the loopback interface
+# when the system is booting.  Do not change this entry.
+##
+127.0.0.1	localhost
+255.255.255.255	broadcasthost
+::1             localhost
+
+
+# ============================
+# Client A
+
+# ----------------------------
+# Development
+
+#192.168.1.80 old.example.test
+
+127.0.0.2 site-one.test
+127.0.0.2 site-two.test
+
+#Archived
+127.0.0.2 site-three.test
+
+# ----------------------------
+# Staging
+#10.0.0.5 disabled.example.com
+203.0.113.10 example.com
+203.0.113.11 www.example.com
+
+# ============================
+# Client B
+
+# ----------------------------
+# Local stack
+127.0.0.1	app.example.dev
+127.0.0.1	api.example.dev

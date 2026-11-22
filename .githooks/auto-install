@@ -1,0 +1,15 @@
+#!/bin/sh
+# Shared by post-commit and post-merge: reinstall when main moves to a commit
+# that isn't the one installed. Enabled with `make hooks`.
+
+branch="$(git symbolic-ref --short -q HEAD)"
+[ "$branch" = main ] || exit 0
+
+head="$(git describe --always --abbrev=7)"
+target="$(make -s -C "$(git rev-parse --show-toplevel)" status 2>/dev/null | sed -n 's/^installed: hosts \([^ ]*\).*/\1/p')"
+[ "$target" = "$head" ] && exit 0
+
+echo "hosts: main is now at $head — installing (tests run first)…"
+# Hooks get no terminal on stdin; give sudo one so it can ask for the password.
+make -s install </dev/tty || echo "hosts: auto-install skipped or failed — run 'make install' when ready."
+exit 0
