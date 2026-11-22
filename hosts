@@ -16,6 +16,21 @@
 #   hosts restore         put back the most recent backup
 #   hosts version         show which version is installed
 #
+# When another program (e.g. a local dev environment's installer) adds its own
+# lines to /etc/hosts, they're spotted as changes outside your sets:
+#
+#   hosts changes         show lines added or removed outside your sets
+#   hosts adopt NAME      move the added lines into set NAME (new or existing);
+#                         add --off to leave that set switched off
+#   hosts keep            accept the added lines as part of the fixed section
+#
+# If another program damages the file (deletes the localhost line, breaks a
+# set's markers, edits inside a set, wrong permissions …):
+#
+#   hosts check           report problems (exit status 1 if there are any)
+#   hosts repair          rebuild the file from known-good parts; shows a diff
+#                         and asks first. Lines other programs added are kept.
+#
 # For testing: HOSTS_FILE, HOSTS_SETS_DIR and NO_SUDO=1 override the defaults.
 
 set -euo pipefail
@@ -25,12 +40,19 @@ VERSION="dev"   # replaced with the git commit by `make install`
 HOSTS_FILE="${HOSTS_FILE:-/etc/hosts}"
 SETS_DIR="${HOSTS_SETS_DIR:-$HOME/.hosts-sets}"
 BACKUP_DIR="$SETS_DIR/.backups"
+BASE_FILE="$SETS_DIR/.base"   # the fixed section (outside all sets), exactly as it was after the last import/adopt/keep
+LAST_FILE="$SETS_DIR/.last-written"   # exact copy of the last hosts file we wrote (records which sets are on)
+# The stock macOS entries every hosts file needs ("IP host" pairs).
+STANDARD_LINES=$'127.0.0.1\tlocalhost\n255.255.255.255\tbroadcasthost\n::1             localhost'
 KEEP_BACKUPS=20
 BEGIN="# >>> hosts-set:"
 END="# <<< hosts-set:"
 
 # Drop blank lines at the start and end of the input; keep the ones in between.
 TIDY='NF { for (; blank > 0; blank--) print ""; print; started = 1; next } started { blank++ }'
+
+# awk helper: compare lines ignoring spacing differences ("1.2.3.4   a" == "1.2.3.4 a").
+NORM='function norm(s) { gsub(/[ \t\r]+/, " ", s); sub(/^ /, "", s); sub(/ $/, "", s); return s }'
 
 # One private scratch folder per run, always removed on exit (including Ctrl-C).
 WORK="$(mktemp -d)"
@@ -43,35 +65,218 @@ need_name() {
   [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "set names may only use letters, numbers, - and _"
 }
 set_file() { echo "$SETS_DIR/$1.hosts"; }
-is_on()    { grep -qxF "$BEGIN$1" "$HOSTS_FILE"; }
+is_on()    { tr -d '\r' < "$HOSTS_FILE" | grep -qxF "$BEGIN$1"; }
 
 mkdir -p "$SETS_DIR" "$BACKUP_DIR"
 
-# Print the hosts file with the named set's block removed. Refuses (rather than
-# guessing) if the block's end marker is missing, so nothing after it is lost.
+# Print a hosts file (default: the real one) with the named set's block removed.
+# Refuses (rather than guessing) if the block's end marker is missing, so
+# nothing after it is lost.
 without_set() {
   awk -v b="$BEGIN$1" -v e="$END$1" '
-    { line = $0; sub(/[ \t\r]+$/, "", line) }
+    { sub(/\r$/, ""); line = $0; sub(/[ \t]+$/, "", line) }
     line == b { if (skip) bad = 1; skip = 1; next }
     line == e { if (!skip) bad = 1; skip = 0; next }
     !skip
-    END { if (skip || bad) exit 3 }' "$HOSTS_FILE" | awk "$TIDY" \
-  || die "the markers for set '$1' in $HOSTS_FILE are damaged; fix them by hand (hosts show) or run: hosts restore"
+    END { if (skip || bad) exit 3 }' "${2:-$HOSTS_FILE}" | awk "$TIDY" \
+  || die "the markers for set '$1' in $HOSTS_FILE are damaged; fix it with: hosts repair"
 }
 
-# Print a set's lines, always newline-terminated and without anything that
+# Print a set file's lines, always newline-terminated and without anything that
 # looks like one of our markers (which would confuse without_set later).
 set_body() {
-  awk '!/^# (>>>|<<<) hosts-set:/' "$(set_file "$1")"
+  awk '!/^# (>>>|<<<) hosts-set:/' "$1"
 }
 
-# Print the hosts file with the named set's block appended (replacing any old one).
+# Print a hosts file with the named set's block appended (replacing any old one).
+# Optional: $2 = hosts file to start from, $3 = set file to use.
 with_set() {
-  without_set "$1"
+  without_set "$1" "${2:-$HOSTS_FILE}"
   echo
   echo "$BEGIN$1"
-  set_body "$1"
+  set_body "${3:-$(set_file "$1")}"
   echo "$END$1"
+}
+
+# --- spotting lines other programs add --------------------------------------
+#
+# .base records the fixed section (everything outside our sets) as it was after
+# our last import/adopt/keep. Any line now outside our sets that isn't in .base
+# was added by something else; lines that are in .base but gone were removed.
+
+# Print the lines of the hosts file that are outside every set's block.
+unmanaged() {
+  awk -v b="$BEGIN" -v e="$END" '
+    index($0, b) == 1 { skip = 1; next }
+    index($0, e) == 1 { skip = 0; next }
+    !skip' "${1:-$HOSTS_FILE}"
+}
+save_base()   { unmanaged "${1:-$HOSTS_FILE}" | tr -d '\r' | awk "$TIDY" > "$BASE_FILE"; }
+ensure_base() { [ -f "$BASE_FILE" ] || save_base; }
+
+# Lines outside the sets that aren't in .base (as written, in file order).
+added_lines() {
+  ensure_base
+  unmanaged > "$WORK/unmanaged"
+  { echo; cat "$BASE_FILE"; } | awk "$NORM"' NR == FNR { n = norm($0); if (n != "") c[n]++; next }
+    { n = norm($0) } n == "" { next } c[n] > 0 { c[n]--; next } { print }' - "$WORK/unmanaged"
+}
+
+# Lines in .base that are no longer anywhere outside the sets.
+removed_lines() {
+  ensure_base
+  unmanaged > "$WORK/unmanaged"
+  { echo; cat "$WORK/unmanaged"; } | awk "$NORM"' NR == FNR { n = norm($0); if (n != "") c[n]++; next }
+    { n = norm($0) } n == "" { next } c[n] > 0 { c[n]--; next } { print }' - "$BASE_FILE"
+}
+
+count_entries() { grep -cvE '^[[:space:]]*(#|$)' "$1" || true; }
+
+# Print the hosts file with the added lines taken out (set blocks untouched).
+without_added() {
+  awk -v b="$BEGIN" -v e="$END" "$NORM"'
+    NR == FNR { n = norm($0); if (n != "") c[n]++; next }
+    index($0, b) == 1 { inblock = 1 }
+    inblock { print; if (index($0, e) == 1) inblock = 0; next }
+    { n = norm($0) }
+    n == "" { print; next }
+    c[n] > 0 { c[n]--; print }' <(echo; cat "$BASE_FILE") "$HOSTS_FILE" \
+  | awk 'NF || !blank { print } { blank = !NF }' | awk "$TIDY"
+}
+
+# One-line nudge shown after list/on/off when something else has edited the file.
+notice_added() {
+  added_lines > "$WORK/added"
+  local n; n="$(count_entries "$WORK/added")"
+  [ "$n" -gt 0 ] || return 0
+  echo
+  printf '  \033[33m!\033[0m %s entr%s added to %s outside your sets (see: hosts changes)\n' \
+    "$n" "$([ "$n" = 1 ] && echo y || echo ies)" "$HOSTS_FILE"
+  echo "    Move them into a set with: hosts adopt NAME   or keep them with: hosts keep"
+}
+
+# --- checking and repairing --------------------------------------------------
+
+# Names of the sets that have a start marker in a file, in file order.
+block_names() {
+  [ -f "$1" ] || return 0
+  awk -v b="$BEGIN" '{ sub(/\r$/, "") } index($0, b) == 1 { n = substr($0, length(b) + 1); if (!(n in seen)) print n; seen[n] = 1 }' "$1"
+}
+
+# A set's lines as they appear in a file, read tolerantly: from its start marker
+# to the next marker of any kind (so a missing end marker doesn't swallow the rest).
+block_content() {
+  [ -f "$2" ] || return 0
+  awk -v b="$BEGIN" -v e="$END" -v want="$BEGIN$1" '
+    { sub(/\r$/, "") }
+    index($0, b) == 1 || index($0, e) == 1 { inb = ($0 == want); next }
+    inb' "$2"
+}
+
+# The standard entries a file is missing (only counting lines outside sets
+# that aren't commented out). Prints them as they should be written.
+missing_standard() {
+  printf '%s\n' "$STANDARD_LINES" > "$WORK/standard"
+  awk -v b="$BEGIN" -v e="$END" '
+    NR == FNR { s = $0; split(s, f, /[ \t]+/); want[NR] = f[1] " " f[2]; line[NR] = $0; n = NR; next }
+    { sub(/\r$/, "") }
+    index($0, b) == 1 { inb = 1; next }
+    index($0, e) == 1 { inb = 0; next }
+    inb { next }
+    { s = $0; sub(/#.*/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s); k = split(s, f, /[ \t]+/)
+      for (i = 2; i <= k; i++) have[f[1] " " f[i]] = 1 }
+    END { for (i = 1; i <= n; i++) if (!(want[i] in have)) print line[i] }' "$WORK/standard" "$1"
+}
+
+# Problems with a hosts file, one per line, each starting CRIT or WARN.
+# CRIT problems block on/off/edit/delete/adopt until repaired.
+problems() {
+  local f="${1:-$HOSTS_FILE}" markers name
+  if [ ! -s "$f" ]; then echo "CRIT $f is missing or empty"; return 0; fi
+  # Without 127.0.0.1 localhost lots of software breaks, so that one blocks changes;
+  # the others are warnings (switching sets can't make them worse). Repair restores all.
+  missing_standard "$f" | while IFS= read -r l; do
+    l="$(printf '%s' "$l" | tr -s ' \t' ' ')"
+    if [ "$l" = "127.0.0.1 localhost" ]; then level=CRIT; else level=WARN; fi
+    printf '%s the standard line "%s" is missing\n' "$level" "$l"; done
+  markers="$(awk -v b="$BEGIN" -v e="$END" '
+    { sub(/\r$/, "") }
+    index($0, b) == 1 { n = substr($0, length(b) + 1)
+      if (open != "") print "CRIT line " NR ": set \"" n "\" starts inside set \"" open "\""
+      if (n in seen) print "CRIT set \"" n "\" appears twice"
+      seen[n] = 1; open = n; next }
+    index($0, e) == 1 { n = substr($0, length(e) + 1)
+      if (open == "") print "CRIT line " NR ": an end marker with no start (\"" n "\")"
+      else if (n != open) print "CRIT line " NR ": the end marker for set \"" open "\" is damaged"
+      open = ""; next }
+    END { if (open != "") print "CRIT set \"" open "\" has no end marker" }' "$f")"
+  [ -z "$markers" ] || echo "$markers"
+  if grep -q $'\r' "$f"; then echo "WARN it has Windows (CRLF) line endings"; fi
+  if [ -n "$(tail -c1 "$f")" ]; then echo "WARN the last line has no line break (the next program to append would join onto it)"; fi
+  local mode; mode="$(stat -f '%Lp' "$f")"
+  [ "$mode" = 644 ] || echo "WARN its permissions are $mode (should be 644, or the system may not read it)"
+  if [ "${NO_SUDO:-}" != 1 ]; then
+    local owner; owner="$(stat -f '%Su:%Sg' "$f")"
+    [ "$owner" = root:wheel ] || echo "WARN it's owned by $owner (should be root:wheel)"
+  fi
+  [ "$f" = "$HOSTS_FILE" ] || return 0
+  # Set contents edited from outside (only checkable when the markers are sound).
+  if [ -z "$markers" ]; then
+    for name in $(block_names "$f"); do
+      if [ ! -f "$(set_file "$name")" ]; then
+        echo "WARN set \"$name\" is in the file but its set file is missing"; continue; fi
+      block_content "$name" "$f" | awk "$NORM"' { n = norm($0) } n != "" { print n }' > "$WORK/in-file"
+      set_body "$(set_file "$name")" | awk "$NORM"' { n = norm($0) } n != "" { print n }' > "$WORK/in-set"
+      cmp -s "$WORK/in-file" "$WORK/in-set" && continue
+      block_content "$name" "$LAST_FILE" 2>/dev/null | awk "$NORM"' { n = norm($0) } n != "" { print n }' > "$WORK/in-last"
+      if cmp -s "$WORK/in-file" "$WORK/in-last"; then
+        echo "WARN set \"$name\" has edits that aren't applied yet (apply with: hosts on $name)"
+      else
+        echo "WARN set \"$name\" was changed inside $f by something else"
+      fi
+    done
+  fi
+  # Sets that were on when we last wrote the file but have vanished from it.
+  for name in $(block_names "$LAST_FILE"); do
+    block_names "$f" | grep -qxF "$name" || echo "WARN set \"$name\" was on, but its lines have been removed"
+  done
+  if [ -f "$BASE_FILE" ]; then
+    removed_lines > "$WORK/removed"
+    local r; r="$(count_entries "$WORK/removed")"
+    [ "$r" -eq 0 ] || echo "WARN $r line(s) of the fixed section were removed by something else (see: hosts changes)"
+  fi
+  return 0
+}
+
+critical() { problems "$@" | sed -n 's/^CRIT //p'; }
+
+# Stop before changing a damaged file; on/off/etc. would only make it worse.
+require_healthy() {
+  local c; c="$(critical)"
+  [ -z "$c" ] && return 0
+  echo "hosts: $HOSTS_FILE is damaged:" >&2
+  echo "$c" | sed 's/^/  ✗ /' >&2
+  die "fix it with: hosts repair   (details: hosts check)"
+}
+
+notice_problems() {
+  local p n; p="$(problems)"
+  [ -n "$p" ] || return 0
+  n="$(echo "$p" | wc -l | tr -d ' ')"
+  echo
+  printf '  \033[31m!\033[0m %s has %s problem%s (see: hosts check). Fix with: hosts repair\n' \
+    "$HOSTS_FILE" "$n" "$([ "$n" = 1 ] || echo s)"
+}
+
+# .last-written is how repair knows which sets should be on. If it doesn't exist
+# yet, take it from the current file if that's sound, else the newest sound backup.
+ensure_last() {
+  [ -f "$LAST_FILE" ] && return 0
+  if [ -z "$(critical)" ]; then cp "$HOSTS_FILE" "$LAST_FILE"; return 0; fi
+  local b
+  for b in $(list_backups | sort -r); do
+    if [ -z "$(critical "$BACKUP_DIR/$b")" ]; then cp "$BACKUP_DIR/$b" "$LAST_FILE"; return 0; fi
+  done
 }
 
 # Next free backup name. Names sort in time order, and two changes within the
@@ -89,19 +294,20 @@ list_backups() { ls -1 "$BACKUP_DIR" 2>/dev/null | grep '^hosts\.' | sort || tru
 install_hosts() {
   local new="$1"
   grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+localhost' "$new" \
-    || die "refusing to write a hosts file without the localhost line"
-  cp "$HOSTS_FILE" "$(backup_name)"
+    || die "refusing to write a hosts file without the localhost line (fix it with: hosts repair)"
+  if [ -e "$HOSTS_FILE" ]; then cp "$HOSTS_FILE" "$(backup_name)"; fi
   local extra=$(( $(list_backups | wc -l) - KEEP_BACKUPS ))
   if [ "$extra" -gt 0 ]; then
     list_backups | head -n "$extra" | while read -r f; do rm -f "$BACKUP_DIR/$f"; done
   fi
   if [ "${NO_SUDO:-}" = 1 ]; then
-    cp "$new" "$HOSTS_FILE"
+    cp "$new" "$HOSTS_FILE"; chmod 644 "$HOSTS_FILE"
   else
     sudo install -m 644 -o root -g wheel "$new" "$HOSTS_FILE"
     sudo dscacheutil -flushcache
     sudo killall -HUP mDNSResponder 2>/dev/null || true
   fi
+  cp "$new" "$LAST_FILE"
 }
 
 cmd_list() {
@@ -114,22 +320,86 @@ cmd_list() {
     else                   printf '  \033[2m○ off\033[0m %s\n' "$name"; fi
   done
   [ $found = 1 ] || echo "No sets yet. Create one with: hosts edit NAME"
+  notice_problems
+  notice_added
 }
 
 cmd_on() {
   need_name "${1:-}"
   [ -f "$(set_file "$1")" ] || die "no set called '$1' (create it with: hosts edit $1)"
+  require_healthy
   with_set "$1" > "$WORK/new"
   install_hosts "$WORK/new"
   echo "'$1' is on"
+  notice_added
 }
 
 cmd_off() {
   need_name "${1:-}"
   is_on "$1" || { echo "'$1' is already off"; return 0; }
+  require_healthy
   without_set "$1" > "$WORK/new"
   install_hosts "$WORK/new"
   echo "'$1' is off"
+  notice_added
+}
+
+cmd_changes() {
+  added_lines > "$WORK/added"
+  removed_lines > "$WORK/removed"
+  if [ ! -s "$WORK/added" ] && [ ! -s "$WORK/removed" ]; then
+    echo "No changes outside your sets."; return 0
+  fi
+  echo "Changes to $HOSTS_FILE outside your sets:"
+  sed 's/^/  + /' "$WORK/added"
+  sed 's/^/  - /' "$WORK/removed"
+  echo
+  [ -s "$WORK/added" ] && echo "Move the + lines into a set with: hosts adopt NAME   (or keep them where they are: hosts keep)"
+  [ -s "$WORK/removed" ] && echo "The - lines were removed by something else; 'hosts keep' accepts that too."
+  return 0
+}
+
+# Move the lines another program added into a set, so they can be switched
+# on and off like any other. Lines the set already has aren't duplicated.
+cmd_adopt() {
+  local name="" off=0 arg
+  for arg in "$@"; do
+    case "$arg" in --off) off=1 ;; *) [ -z "$name" ] || die "usage: hosts adopt NAME [--off]"; name="$arg" ;; esac
+  done
+  need_name "$name"
+  require_healthy
+  added_lines > "$WORK/added"
+  [ "$(count_entries "$WORK/added")" -gt 0 ] || { echo "No new entries outside your sets."; return 0; }
+
+  local f; f="$(set_file "$name")"
+  if [ -f "$f" ]; then cp "$f" "$WORK/set"
+  else printf '# Set: %s\n# Adopted from %s on %s\n' "$name" "$HOSTS_FILE" "$(date +%Y-%m-%d)" > "$WORK/set"; fi
+  awk "$NORM"' NR == FNR { have[norm($0)] = 1; next }
+    { n = norm($0) } !(n in have) { print; have[n] = 1 }' "$WORK/set" "$WORK/added" > "$WORK/new-lines"
+
+  echo "Moving these lines into '$name':"
+  sed 's/^/  + /' "$WORK/added"
+  [ -s "$WORK/new-lines" ] || echo "  (all of them are already in '$name', so they're just removed from the fixed section)"
+  cat "$WORK/new-lines" >> "$WORK/set"
+
+  without_added > "$WORK/stage"
+  if [ $off = 1 ]; then without_set "$name" "$WORK/stage" > "$WORK/new"
+  else                  with_set "$name" "$WORK/stage" "$WORK/set" > "$WORK/new"; fi
+  # Hosts file first, then the set: if the write fails nothing has changed.
+  install_hosts "$WORK/new"
+  cp "$WORK/set" "$f"
+  save_base
+  if [ $off = 1 ]; then echo "'$name' is off"; else echo "'$name' is on"; fi
+}
+
+cmd_keep() {
+  added_lines > "$WORK/added"
+  removed_lines > "$WORK/removed"
+  if [ ! -s "$WORK/added" ] && [ ! -s "$WORK/removed" ]; then
+    echo "No changes outside your sets."; return 0
+  fi
+  save_base
+  echo "Kept. The lines outside your sets are now treated as the fixed section."
 }
 
 run_editor() {
@@ -150,6 +420,7 @@ cmd_edit() {
   cp "$f" "$WORK/before"
   run_editor "$f"
   if is_on "$1" && ! cmp -s "$f" "$WORK/before"; then
+    require_healthy
     with_set "$1" > "$WORK/new"
     install_hosts "$WORK/new"
     echo "'$1' updated in hosts file"
@@ -166,6 +437,7 @@ cmd_delete() {
   need_name "${1:-}"
   [ -f "$(set_file "$1")" ] || die "no set called '$1'"
   if is_on "$1"; then
+    require_healthy
     without_set "$1" > "$WORK/new"
     install_hosts "$WORK/new"
   fi
@@ -221,6 +493,7 @@ cmd_import() {
   # no sets have been saved and import can simply be run again.
   install_hosts "$new"
   for f in "$dir"/sets/*.hosts; do [ -e "$f" ] && cp "$f" "$SETS_DIR/"; done
+  save_base
   echo "Imported. Your previous hosts file is saved in $BACKUP_DIR"
 }
 
@@ -235,6 +508,118 @@ cmd_restore() {
   echo "restored"
 }
 
+cmd_check() {
+  local p; p="$(problems)"
+  if [ -z "$p" ]; then
+    echo "No problems found with $HOSTS_FILE."
+    notice_added
+    return 0
+  fi
+  echo "Problems with $HOSTS_FILE:"
+  echo "$p" | sed -e 's/^CRIT /  ✗ /' -e 's/^WARN /  ! /'
+  echo
+  echo "Fix with: hosts repair   (shows the changes and asks first)"
+  notice_added
+  return 1
+}
+
+# Rebuild the hosts file from known-good parts:
+#   1. the current file's own lines (outside sets), with set lines and markers taken out;
+#      lines other programs put in — even inside a set's block — are kept, still flagged as added
+#   2. the fixed section as last recorded (.base), so removed lines come back, then
+#      any missing standard lines (localhost etc.)
+#   3. a fresh block, from its set file, for every set that was on
+cmd_repair() {
+  local src="$WORK/current" name
+  if [ -f "$HOSTS_FILE" ]; then tr -d '\r' < "$HOSTS_FILE" > "$src"; else : > "$src"; fi
+  if [ ! -f "$BASE_FILE" ] && [ -f "$LAST_FILE" ]; then save_base "$LAST_FILE"; fi
+
+  # Which sets should be on: those on when we last wrote the file, plus any still marked.
+  local names; names="$( { block_names "$LAST_FILE"; block_names "$src"; } | awk '!seen[$0]++')"
+  mkdir -p "$WORK/sets" "$WORK/recovered"
+  printf '\t\n' > "$WORK/members"    # never empty (awk NR==FNR trick)
+  local on=""
+  for name in $names; do
+    [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+    if [ -f "$(set_file "$name")" ]; then
+      set_body "$(set_file "$name")" > "$WORK/sets/$name"
+    elif [ -n "$(block_content "$name" "$LAST_FILE" 2>/dev/null)" ]; then
+      block_content "$name" "$LAST_FILE" > "$WORK/sets/$name"; cp "$WORK/sets/$name" "$WORK/recovered/$name.hosts"
+    elif [ -n "$(block_content "$name" "$src")" ]; then
+      block_content "$name" "$src" > "$WORK/sets/$name"; cp "$WORK/sets/$name" "$WORK/recovered/$name.hosts"
+    else
+      continue
+    fi
+    # A set's own lines are what its file says now, plus what we last wrote for it
+    # (so a line you've since removed from the set file isn't mistaken for a foreign one).
+    { cat "$WORK/sets/$name"; block_content "$name" "$LAST_FILE" 2>/dev/null || true; } \
+      | awk -v n="$name" "$NORM"' { l = norm($0) } l != "" { print n "\t" l }' >> "$WORK/members"
+    on="$on $name"
+  done
+
+  # 1. Everything that isn't a marker or one of a set's own lines.
+  awk -v b="$BEGIN" -v e="$END" "$NORM"'
+    NR == FNR { i = index($0, "\t"); m[substr($0, 1, i - 1) SUBSEP substr($0, i + 1)] = 1; next }
+    index($0, b) == 1 { cur = substr($0, length(b) + 1); next }
+    index($0, e) == 1 {
+      # Text glued onto an end marker (something appended to a file with no final
+      # line break) is kept as its own line.
+      rest = substr($0, length(e) + 1)
+      if (cur != "" && index(rest, cur) == 1) { rest = substr(rest, length(cur) + 1); gsub(/^[ \t]+/, "", rest); if (rest != "") print rest }
+      cur = ""; next }
+    { n = norm($0) }
+    cur != "" && n == "" { next }
+    cur != "" && ((cur SUBSEP n) in m) { next }
+    { print }' "$WORK/members" "$src" > "$WORK/fixed"
+
+  # 2a. The known-good fixed section in its own order, followed by any lines
+  #     other programs added (kept, and still flagged as added).
+  if [ -f "$BASE_FILE" ]; then
+    { echo; cat "$BASE_FILE"; } | awk "$NORM"' NR == FNR { n = norm($0); if (n != "") c[n]++; next }
+      { n = norm($0) } n == "" { next } c[n] > 0 { c[n]--; next } { print }' - "$WORK/fixed" > "$WORK/foreign"
+    { cat "$BASE_FILE"; if [ -s "$WORK/foreign" ]; then echo; cat "$WORK/foreign"; fi; } > "$WORK/fixed"
+  fi
+  # 2b. Standard lines, inserted before the first entry.
+  missing_standard "$WORK/fixed" > "$WORK/std"
+  if [ -s "$WORK/std" ]; then
+    awk 'NR == FNR { add = add $0 "\n"; next }
+      !done && $0 !~ /^[ \t]*(#|$)/ { printf "%s", add; done = 1 }
+      { print } END { if (!done) printf "%s", add }' "$WORK/std" "$WORK/fixed" > "$WORK/fixed2"
+  else
+    cp "$WORK/fixed" "$WORK/fixed2"
+  fi
+
+  # 3. Fresh blocks for the sets that are on.
+  awk "$TIDY" "$WORK/fixed2" > "$WORK/repaired"
+  for name in $on; do
+    { echo; echo "$BEGIN$name"; cat "$WORK/sets/$name"; echo "$END$name"; } >> "$WORK/repaired"
+  done
+
+  local p; p="$(problems)"
+  if [ -f "$HOSTS_FILE" ] && cmp -s "$HOSTS_FILE" "$WORK/repaired" && [ -z "$p" ]; then
+    echo "Nothing to repair."; return 0
+  fi
+  if [ -n "$p" ]; then
+    echo "Problems found:"; echo "$p" | sed -e 's/^CRIT /  ✗ /' -e 's/^WARN /  ! /'; echo
+  fi
+  if [ -f "$HOSTS_FILE" ] && cmp -s "$HOSTS_FILE" "$WORK/repaired"; then
+    echo "The contents are fine; only the file's permissions will be reset."
+  else
+    echo "Proposed changes:"; diff "$HOSTS_FILE" "$WORK/repaired" 2>/dev/null || true
+  fi
+  printf 'Repair %s? [y/N] ' "$HOSTS_FILE"; local ans=""; read -r ans || true
+  [ "$ans" = y ] || [ "$ans" = Y ] || { echo "cancelled"; return 0; }
+  install_hosts "$WORK/repaired"
+  for f in "$WORK"/recovered/*.hosts; do
+    [ -e "$f" ] || continue
+    cp "$f" "$SETS_DIR/"; echo "Recovered the missing set file for '$(basename "$f" .hosts)' from the hosts file."
+  done
+  echo "Repaired. The previous file is saved in $BACKUP_DIR"
+  notice_added
+}
+
+ensure_last
+
 case "${1:-list}" in
   list|ls)      cmd_list ;;
   on|enable)    cmd_on "${2:-}" ;;
@@ -244,7 +629,12 @@ case "${1:-list}" in
   delete|rm)    cmd_delete "${2:-}" ;;
   import)       cmd_import ;;
   restore)      cmd_restore ;;
+  changes|diff) cmd_changes ;;
+  adopt)        shift; cmd_adopt "$@" ;;
+  keep)         cmd_keep ;;
+  check|doctor) cmd_check ;;
+  repair|fix)   cmd_repair ;;
   version|-v|--version) echo "hosts $VERSION" ;;
-  -h|--help|help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (try: hosts help)" ;;
 esac

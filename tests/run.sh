@@ -225,6 +225,270 @@ test_import_rejects_non_ihosts_file() {
   ! h import 2>/dev/null; check [ $? = 0 ]
 }
 
+# --- lines added by other programs -------------------------------------------
+
+# Imported sample, then "an installer" appends its own lines outside any set.
+installer_adds() {
+  fresh; cp "$FIXTURES/ihosts-sample" "$T/hosts"; echo y | h import >/dev/null
+  printf '\n# Added by devenv\n127.0.0.1\tproj.example.dev\n127.0.0.1\tapi.proj.example.dev\n' >> "$T/hosts"
+}
+
+test_changes_none_after_import() {
+  fresh; cp "$FIXTURES/ihosts-sample" "$T/hosts"; echo y | h import >/dev/null
+  says "No changes outside your sets" changes
+  local out; out="$(h list)"; [[ "$out" != *"outside your sets"* ]] || fail "list shouldn't warn"
+}
+
+test_changes_spots_added_lines() {
+  installer_adds
+  says "+ 127.0.0.1	proj.example.dev" changes
+  says "2 entries added" list
+  says "hosts adopt NAME" list
+}
+
+test_changes_spots_removed_lines() {
+  installer_adds; h keep >/dev/null
+  sed -i '' '/^255.255.255.255/d' "$T/hosts"
+  says "- 255.255.255.255	broadcasthost" changes
+}
+
+test_changes_ignore_spacing_and_set_contents() {
+  fresh; echo "10.0.0.1 one.test" > "$T/sets/one.hosts"; h on one
+  printf '127.0.0.1    localhost\n' > "$T/hosts.new"           # same line, different spacing
+  sed -n '2,$p' "$T/hosts" >> "$T/hosts.new"; mv "$T/hosts.new" "$T/hosts"
+  says "No changes outside your sets" changes
+}
+
+test_adopt_new_set() {
+  installer_adds; cp "$T/hosts" "$T/before"
+  h adopt devenv
+  set_on devenv
+  contains "$T/sets/devenv.hosts" "proj.example.dev"
+  contains "$T/sets/devenv.hosts" "# Added by devenv"          # comments come along
+  count "$T/hosts" "proj.example.dev" 2                         # proj + api.proj, once each
+  same_entries "$T/hosts" "$T/before"                           # nothing resolves differently
+  says "No changes outside your sets" changes
+  h off devenv; lacks "$T/hosts" "proj.example.dev"
+  for s in development staging local-stack; do set_on "$s"; done  # other sets untouched
+}
+
+test_adopt_off() {
+  installer_adds
+  h adopt devenv --off
+  set_off devenv; lacks "$T/hosts" "proj.example.dev"
+  contains "$T/sets/devenv.hosts" "api.proj.example.dev"
+  says "No changes outside your sets" changes
+}
+
+test_adopt_into_existing_set_dedupes() {
+  installer_adds; h adopt devenv >/dev/null
+  printf '127.0.0.1 proj.example.dev\n127.0.0.1 new.example.dev\n' >> "$T/hosts"   # installer runs again
+  h adopt devenv
+  check [ "$(grep -cE '^127\.0\.0\.1[[:space:]]+proj\.example\.dev$' "$T/sets/devenv.hosts")" = 1 ]
+  count "$T/sets/devenv.hosts" "new.example.dev" 1
+  count "$T/hosts" "new.example.dev" 1
+  says "No changes outside your sets" changes
+}
+
+test_adopt_while_set_off_keeps_it_off_with_flag() {
+  installer_adds; h adopt devenv >/dev/null; h off devenv >/dev/null
+  printf '127.0.0.1 proj.example.dev\n' >> "$T/hosts"                            # installer re-adds
+  h adopt devenv --off
+  set_off devenv; lacks "$T/hosts" "proj.example.dev"
+}
+
+test_adopt_nothing_to_adopt() {
+  fresh; cp "$FIXTURES/ihosts-sample" "$T/hosts"; echo y | h import >/dev/null; cp "$T/hosts" "$T/before"
+  says "No new entries" adopt devenv
+  check [ ! -e "$T/sets/devenv.hosts" ]; same_file "$T/hosts" "$T/before"
+}
+
+test_adopt_bad_args() {
+  installer_adds; cp "$T/hosts" "$T/before"
+  ! h adopt 2>/dev/null; check [ $? = 0 ]
+  ! h adopt a b 2>/dev/null; check [ $? = 0 ]
+  ! h adopt "bad name" 2>/dev/null; check [ $? = 0 ]
+  same_file "$T/hosts" "$T/before"
+}
+
+test_adopt_failed_write_changes_nothing() {
+  installer_adds; chmod 444 "$T/hosts"
+  ! h adopt devenv >/dev/null 2>&1; check [ $? = 0 ]
+  check [ ! -e "$T/sets/devenv.hosts" ]
+  chmod 644 "$T/hosts"; says "2 entries added" list           # still flagged, can retry
+}
+
+test_keep() {
+  installer_adds; cp "$T/hosts" "$T/before"
+  says "Kept" keep
+  same_file "$T/hosts" "$T/before"                              # keep never rewrites hosts
+  says "No changes outside your sets" changes
+}
+
+test_on_off_dont_swallow_added_lines() {
+  installer_adds
+  h off staging >/dev/null; h on staging >/dev/null
+  says "2 entries added" list                                   # still flagged, not absorbed
+  contains "$T/hosts" "proj.example.dev"
+}
+
+# --- damage and repair -------------------------------------------------------
+#
+# Each scenario starts from the imported sample with 'staging' switched off,
+# damages the file the way a misbehaving installer might, then checks that:
+#   check fails · repair restores the same on/off states and a healthy file ·
+#   lines the "installer" added survive (and are still flagged) · a second repair does nothing.
+
+healthy_start() {
+  fresh; cp "$FIXTURES/ihosts-sample" "$T/hosts"; echo y | h import >/dev/null; h off staging >/dev/null
+}
+FOREIGN="127.0.0.1 proj.example.dev"
+
+repaired_ok() {   # $1 = 1 if the installer's line should have survived
+  ! h check >/dev/null 2>&1; check [ $? = 0 ]
+  echo y | h repair || fail "repair failed"
+  says "No problems found" check
+  set_on development; set_on local-stack; set_off staging
+  contains "$T/hosts" $'127.0.0.1\tlocalhost'
+  contains "$T/hosts" "site-one.test"; contains "$T/hosts" "app.example.dev"; lacks "$T/hosts" "203.0.113.10"
+  if [ "${1:-0}" = 1 ]; then contains "$T/hosts" "$FOREIGN"; says "+ $FOREIGN" changes; fi
+  cp "$T/hosts" "$T/after"; says "Nothing to repair" repair; same_file "$T/hosts" "$T/after"
+  h off development >/dev/null && h on development >/dev/null || fail "on/off should work after repair"
+}
+
+test_check_healthy() { healthy_start; says "No problems found" check; says "Nothing to repair" repair; }
+
+test_repair_localhost_deleted() {
+  healthy_start; sed -i '' '/^127.0.0.1	localhost$/d' "$T/hosts"
+  local out; out="$(h on staging 2>&1)" && fail "on should be blocked until repaired"
+  [[ "$out" == *"fix it with: hosts repair"* ]] || fail "should point to hosts repair"
+  repaired_ok
+}
+
+test_repair_localhost_commented_out() {
+  healthy_start; sed -i '' 's/^127.0.0.1	localhost$/#127.0.0.1	localhost/' "$T/hosts"
+  repaired_ok
+}
+
+test_repair_other_standard_lines() {
+  healthy_start; sed -i '' -e '/^255.255.255.255/d' -e '/^::1/d' "$T/hosts"
+  says "broadcasthost\" is missing" check
+  h off development >/dev/null || fail "missing ::1/broadcasthost shouldn't block on/off"
+  h on development >/dev/null
+  repaired_ok; contains "$T/hosts" "broadcasthost"; contains "$T/hosts" "::1"
+}
+
+test_repair_end_marker_deleted() {
+  healthy_start; sed -i '' '/^# <<< hosts-set:development$/d' "$T/hosts"; echo "$FOREIGN" >> "$T/hosts"
+  repaired_ok 1
+}
+
+test_repair_start_marker_deleted() {
+  healthy_start; sed -i '' '/^# >>> hosts-set:local-stack$/d' "$T/hosts"; echo "$FOREIGN" >> "$T/hosts"
+  repaired_ok 1
+}
+
+test_repair_file_replaced_by_installer() {
+  healthy_start; printf '%s\n127.0.0.1 api.proj.example.dev\n' "$FOREIGN" > "$T/hosts"
+  repaired_ok 1
+  contains "$T/hosts" "# Host Database"                            # fixed section comes back in order
+  check [ "$(head -1 "$T/hosts")" = "##" ]
+}
+
+test_repair_file_emptied() {
+  healthy_start; : > "$T/hosts"
+  says "missing or empty" check 2>&1 || true
+  repaired_ok
+}
+
+test_repair_crlf() {
+  healthy_start; sed -i '' 's/$/'$'\r''/' "$T/hosts"
+  says "CRLF" check 2>&1 || true
+  repaired_ok; ! grep -q $'\r' "$T/hosts" || fail "CRLF should be gone"
+}
+
+test_repair_append_without_final_newline() {
+  healthy_start; printf '%s' "$(cat "$T/hosts")" > "$T/hosts.t"; mv "$T/hosts.t" "$T/hosts"
+  says "no line break" check 2>&1 || true
+  printf '%s\n' "$FOREIGN" >> "$T/hosts"                            # glued onto the last end marker
+  repaired_ok 1
+}
+
+test_repair_permissions() {
+  healthy_start; chmod 600 "$T/hosts"; cp "$T/hosts" "$T/before"
+  says "permissions are 600" check 2>&1 || true
+  echo y | h repair >/dev/null; check [ "$(stat -f %Lp "$T/hosts")" = 644 ]
+  same_file "$T/hosts" "$T/before"
+}
+
+test_repair_edit_inside_block() {
+  healthy_start; sed -i '' 's/^127.0.0.2 site-two.test$/10.9.9.9 site-two.test/' "$T/hosts"
+  says "was changed inside" check 2>&1 || true
+  repaired_ok
+  contains "$T/hosts" "127.0.0.2 site-two.test"                    # set's own line back in its block
+  contains "$T/hosts" "10.9.9.9 site-two.test"; says "+ 10.9.9.9 site-two.test" changes   # installer's kept, flagged
+}
+
+test_repair_duplicated_block() {
+  healthy_start
+  awk -v b="# >>> hosts-set:development" -v e="# <<< hosts-set:development" '$0 == b { p = 1 } p { print } $0 == e { p = 0 }' "$T/hosts" > "$T/dup"
+  { echo; cat "$T/dup"; } >> "$T/hosts"
+  says "appears twice" check 2>&1 || true
+  repaired_ok; count "$T/hosts" "# >>> hosts-set:development" 1
+}
+
+test_repair_block_removed() {
+  healthy_start
+  awk -v b="# >>> hosts-set:local-stack" -v e="# <<< hosts-set:local-stack" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$T/hosts" > "$T/h"; mv "$T/h" "$T/hosts"
+  says "was on, but its lines have been removed" check 2>&1 || true
+  repaired_ok
+}
+
+test_repair_recovers_deleted_set_file() {
+  healthy_start; rm "$T/sets/local-stack.hosts"; sed -i '' '/^# <<< hosts-set:local-stack$/d' "$T/hosts"
+  echo y | h repair >/dev/null
+  check [ -f "$T/sets/local-stack.hosts" ]; contains "$T/sets/local-stack.hosts" "api.example.dev"
+  says "No problems found" check; set_on local-stack
+}
+
+test_repair_cancel_changes_nothing() {
+  healthy_start; sed -i '' '/^127.0.0.1	localhost$/d' "$T/hosts"; cp "$T/hosts" "$T/before"
+  echo n | says cancelled repair
+  same_file "$T/hosts" "$T/before"
+}
+
+test_repair_respects_direct_set_file_edit() {
+  healthy_start
+  sed -i '' '/site-two.test/d' "$T/sets/development.hosts"        # edited by hand, not yet applied
+  says "edits that aren't applied yet" check
+  echo y | h repair >/dev/null
+  lacks "$T/hosts" "site-two.test"; says "No changes outside your sets" changes
+  says "No problems found" check
+}
+
+test_repair_after_blocked_edit() {
+  healthy_start; sed -i '' '/^# <<< hosts-set:local-stack$/d' "$T/hosts"   # damaged
+  local ed="$T/ed"; printf '#!/bin/sh\nsed -i "" "/site-two.test/d" "$1"\n' > "$ed"; chmod +x "$ed"
+  ! EDITOR="$ed" h edit development >/dev/null 2>&1; check [ $? = 0 ]      # saved, but write blocked
+  echo y | h repair >/dev/null
+  lacks "$T/hosts" "site-two.test"; says "No changes outside your sets" changes
+  set_on development; set_on local-stack; says "No problems found" check
+}
+
+test_crlf_file_still_lists_and_switches() {
+  healthy_start; sed -i '' 's/$/'$'\r''/' "$T/hosts"
+  set_on development; set_off staging
+  h off development >/dev/null; set_off development; lacks "$T/hosts" "site-one.test"
+  ! grep -q $'\r' "$T/hosts" || fail "on/off shouldn't leave CRLF behind"
+}
+
+test_vanished_check_uses_exact_names() {
+  fresh; echo "10.0.0.1 a.test" > "$T/sets/dev.hosts"; echo "10.0.0.2 b.test" > "$T/sets/development.hosts"
+  h on dev >/dev/null; h on development >/dev/null
+  awk -v b="# >>> hosts-set:dev" -v e="# <<< hosts-set:dev" '$0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$T/hosts" > "$T/h"; mv "$T/h" "$T/hosts"
+  says 'set "dev" was on, but its lines have been removed' check
+}
+
 # --- run ---------------------------------------------------------------------
 
 echo "Running hosts tests"
