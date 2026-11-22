@@ -1,8 +1,6 @@
 # hosts
 
-A small command-line tool for switching sets of `/etc/hosts` entries on and off — a
-replacement for iHosts that's one readable bash script with no background
-service and no network access.
+A small command-line tool for switching sets of `/etc/hosts` entries on and off —  one readable bash script with no background service and no network access.
 
 ```
 $ hosts
@@ -50,7 +48,7 @@ Set names may use letters, numbers, `-` and `_`.
 `EDITOR` follows the same rules as git: `EDITOR="code -w"`, or quote a path with spaces:
 `EDITOR="'/Applications/Sublime Text.app/Contents/SharedSupport/bin/subl' -w"`.
 
-## Moving from iHosts
+## Migrating from iHosts
 
 1. In iHosts, switch **every** set on, so they're all written into `/etc/hosts`
    (iHosts keeps switched-off sets in its own private storage, which can't be read).
